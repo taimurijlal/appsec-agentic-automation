@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-appsec-demo"
+version = "1.0.0"
+description = "AI-Augmented AppSec Pull Request training demo (GlobalTech Customer Account Service)"
+requires-python = ">=3.9"
+
+[tool.pytest.ini_options]
+# Run pytest from the repository root so `import app...` resolves.
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.bandit]
+# Bandit scans the application code. Tests contain intentionally "malicious"
+# strings as fixtures, so they are excluded to avoid noisy false positives.
+exclude_dirs = ["tests", "artifacts", ".github"]

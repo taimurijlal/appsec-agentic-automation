@@ -1,0 +1,5 @@
+# Development / CI dependencies (deterministic AppSec tooling + tests).
+-r requirements.txt
+
+pytest>=8.0.0     # unit and security regression tests
+bandit>=1.7.0     # static application security testing (SAST) for Python
