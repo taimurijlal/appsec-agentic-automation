@@ -1,0 +1,356 @@
+# =============================================================================
+# AI-Augmented AppSec Pull Request Pipeline
+# =============================================================================
+# This single workflow runs distinct, dependent jobs that together demonstrate a
+# modern AppSec lifecycle on a pull request:
+#
+#   Baseline Security Checks  (pytest + Bandit — deterministic tooling first)
+#        -> AI Security Reviewer      (read-only; posts a finding)
+#        -> AI Security Fixer         (narrow write; commits a minimal patch)
+#        -> Independent Verifier      (fresh checkout; re-reviews the fix)
+#        -> AppSec Summary            (explains the whole lifecycle)
+#
+# Design principles (see README.md):
+#   * AI COMPLEMENTS deterministic AppSec tooling — it never replaces it.
+#   * Least privilege per job (permissions are scoped per job, not globally).
+#   * The fixer proposes; an INDEPENDENT agent verifies. No self-certification.
+#   * Nothing is auto-merged or deployed. A human owns the final merge.
+#
+# Loop prevention: the fixer commits with the built-in GITHUB_TOKEN. GitHub does
+# NOT start a new workflow run for pushes made with GITHUB_TOKEN, so the fixer's
+# own commit cannot trigger this workflow again. (Using a personal access token
+# instead would break that safety property — don't.)
+#
+# Safety scope: v1 assumes trusted, SAME-REPOSITORY pull requests. It must NOT
+# be reconfigured to expose secrets or write tokens to untrusted forked PRs
+# (e.g. via pull_request_target checking out fork code) — see README.
+# =============================================================================
+
+name: AI AppSec Pipeline
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+# No permissions by default; each job requests only what it needs.
+permissions: {}
+
+# One in-flight run per PR; a new push cancels the superseded run.
+concurrency:
+  group: ai-appsec-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  # Model is configurable via a repository variable; falls back in the scripts.
+  ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Baseline Security Checks — deterministic tooling runs FIRST.
+  # ---------------------------------------------------------------------------
+  baseline-security:
+    name: Baseline Security Checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run unit + security tests (pytest)
+        run: |
+          mkdir -p artifacts
+          # Informational: we don't fail the pipeline here, so the AI stages can
+          # still demonstrate the full lifecycle. The results feed the reviewer.
+          python -m pytest -ra > artifacts/pytest-results.txt 2>&1 || true
+          echo "----- pytest output -----"
+          cat artifacts/pytest-results.txt
+
+      - name: Run SAST (Bandit)
+        run: |
+          # Bandit exits non-zero when it finds issues; capture rather than fail
+          # so the reviewer can use the findings as evidence.
+          bandit -r app -f json -o artifacts/bandit-results.json || true
+          echo "----- bandit summary -----"
+          python -c "import json;d=json.load(open('artifacts/bandit-results.json'));print(len(d.get('results',[])),'finding(s)')" || true
+
+      - name: Upload baseline results
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-results
+          path: |
+            artifacts/pytest-results.txt
+            artifacts/bandit-results.json
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # 2. AI Security Reviewer — READ-ONLY. Analyzes the diff, posts a finding.
+  # ---------------------------------------------------------------------------
+  security-review:
+    name: AI Security Reviewer
+    needs: baseline-security
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read          # read code
+      pull-requests: write    # post the review comment
+      issues: write           # PR comments use the issues API
+    outputs:
+      finding: ${{ steps.review.outputs.finding }}
+      title: ${{ steps.review.outputs.title }}
+      severity: ${{ steps.review.outputs.severity }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0        # need base + head to compute the diff
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Download baseline results
+        uses: actions/download-artifact@v4
+        with:
+          name: baseline-results
+          path: artifacts
+
+      - name: Collect PR context (diff, changed files, metadata)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python scripts/collect_pr_diff.py
+
+      - name: Run AI Security Reviewer
+        id: review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python scripts/run_security_review.py
+
+      - name: Post review comment to PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python scripts/post_pr_comment.py --file artifacts/security-review-comment.md
+
+      - name: Upload review results
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-results
+          path: |
+            artifacts/security-review.json
+            artifacts/security-review-comment.md
+            artifacts/pr-context.json
+            artifacts/pr-diff.txt
+            artifacts/changed-files.txt
+            artifacts/changed-files-content.txt
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # 3. AI Security Fixer — NARROW WRITE. Runs only when a finding was made.
+  #    Applies a minimal patch, validates it, and (only if valid) commits it.
+  # ---------------------------------------------------------------------------
+  security-fix:
+    name: AI Security Fixer
+    needs: security-review
+    if: needs.security-review.outputs.finding == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write         # commit the patch to the PR branch
+      pull-requests: write    # post the fix comment
+    outputs:
+      fix_status: ${{ steps.fixer.outputs.fix_status }}
+      tests: ${{ steps.validate.outputs.tests }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Download review + baseline results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "{review,baseline}-results"   # finding + the SAST output
+          path: artifacts
+          merge-multiple: true
+
+      - name: Run AI Security Fixer
+        id: fixer
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python scripts/run_security_fixer.py
+
+      - name: Capture proposed patch as a diff
+        if: steps.fixer.outputs.fix_status == 'proposed'
+        run: git diff > artifacts/security-fix.diff
+
+      - name: Validate the fix (pytest + Bandit)
+        id: validate
+        if: steps.fixer.outputs.fix_status == 'proposed'
+        run: |
+          if python -m pytest -ra > artifacts/pytest-results.txt 2>&1; then
+            echo "tests=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "tests=fail" >> "$GITHUB_OUTPUT"
+          fi
+          echo "----- post-fix pytest output -----"; cat artifacts/pytest-results.txt
+          bandit -r app -f json -o artifacts/bandit-results.json || true
+
+      - name: Commit the fix to the PR branch
+        id: commit
+        if: steps.fixer.outputs.fix_status == 'proposed' && steps.validate.outputs.tests == 'pass'
+        run: |
+          git config user.name "AI AppSec Bot"
+          git config user.email "ai-appsec-bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No source changes to commit."
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "security: remediate AI security review finding"
+            # Push with GITHUB_TOKEN — this does NOT re-trigger the workflow.
+            git push origin "HEAD:${{ github.head_ref }}"
+            echo "committed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compose fix comment
+        if: steps.fixer.outputs.fix_status != 'skipped'
+        env:
+          TESTS_RESULT: ${{ steps.validate.outputs.tests }}
+          COMMITTED: ${{ steps.commit.outputs.committed }}
+        run: python scripts/compose_fix_comment.py
+
+      - name: Post fix comment to PR
+        if: steps.fixer.outputs.fix_status != 'skipped'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python scripts/post_pr_comment.py --file artifacts/security-fix-comment.md
+
+      - name: Upload fix results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fix-results
+          path: |
+            artifacts/security-fix.json
+            artifacts/security-fix.diff
+            artifacts/security-fix-comment.md
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # 4. Independent Security Verifier — READ-ONLY, FRESH checkout of the patched
+  #    branch. A different agent re-runs the tests and re-reviews the fix.
+  # ---------------------------------------------------------------------------
+  security-verify:
+    name: Independent Security Verifier
+    needs: [security-review, security-fix]
+    if: needs.security-review.outputs.finding == 'true' && needs.security-fix.outputs.tests == 'pass'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    outputs:
+      verdict: ${{ steps.verify.outputs.verdict }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}   # includes the fixer's committed patch
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Download review + fix results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "{review,fix}-results"
+          path: artifacts
+          merge-multiple: true
+
+      - name: Independently re-run tests + SAST (post-fix)
+        run: |
+          python -m pytest -ra > artifacts/pytest-results.txt 2>&1 || true
+          cp artifacts/pytest-results.txt artifacts/pytest-results-postfix.txt
+          echo "----- independent post-fix pytest -----"; cat artifacts/pytest-results.txt
+          bandit -r app -f json -o artifacts/bandit-results.json || true
+          cp artifacts/bandit-results.json artifacts/bandit-results-postfix.json
+
+      - name: Run Independent Security Verifier
+        id: verify
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python scripts/run_security_verifier.py
+
+      - name: Post verification comment to PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python scripts/post_pr_comment.py --file artifacts/security-verification-comment.md
+
+      - name: Upload verification results
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-results
+          path: |
+            artifacts/security-verification.json
+            artifacts/security-verification-comment.md
+            artifacts/pytest-results-postfix.txt
+            artifacts/bandit-results-postfix.json
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # 5. AppSec Summary — COMMUNICATION ONLY. Always runs; explains the outcome.
+  # ---------------------------------------------------------------------------
+  security-summary:
+    name: AppSec Summary
+    needs: [baseline-security, security-review, security-fix, security-verify]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Download all available results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-results"
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate AppSec summary
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python scripts/generate_summary.py
+
+      - name: Post final summary to PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python scripts/post_pr_comment.py --file artifacts/appsec-summary.md
