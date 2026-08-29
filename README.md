@@ -139,6 +139,14 @@ git remote add origin git@github.com:<you>/<repo>.git
 git push -u origin main
 ```
 
+> ⚠️ **Push with git — not the browser "Upload files" button.** The web uploader
+> silently skips dot-folders, including `.github/`, which holds the workflow that
+> runs the *entire* pipeline (the #1 cause of "I opened a PR but nothing
+> happened"). If you must use the browser, create files via **Add file → Create
+> new file** and type the full path (e.g. `.github/workflows/ai-appsec.yml`).
+> Also note: pushing anything under `.github/workflows/` over HTTPS requires a
+> Personal Access Token with the **`workflow`** scope — or use SSH.
+
 `main` now holds the **secure** baseline (parameterized SQL) and all tests pass.
 
 ### 2. Run it locally (recommended before the lesson)
@@ -164,13 +172,21 @@ The AI stages call the **Anthropic (Claude) API** directly (see
   Same page → **Variables → New repository variable**. Set it to the model you
   want (e.g. `claude-opus-5`). If unset, the scripts fall back to a sensible
   default, so the demo is never pinned to one version.
+- **Variable (only for identity-linked keys)** — `ANTHROPIC_WORKSPACE_ID`
+  Most keys need nothing here. But if your key is *identity-linked* (it can act
+  across multiple workspaces), the API returns
+  `400 … anthropic-workspace-id is required`. Two ways to resolve it:
+  **(a)** the simplest — create a **workspace-scoped** API key instead (no
+  variable needed); or **(b)** set an `ANTHROPIC_WORKSPACE_ID` repository
+  variable to your workspace id (Anthropic Console → **Settings → Workspaces**).
+  The scripts send it automatically when present.
 
 > `GITHUB_TOKEN` is provided automatically by GitHub Actions — you do **not**
 > create it. Its per-job permissions are set in the workflow.
 
 ---
 
-## Create the demo vulnerability
+## Create the demo vulnerability (SQL injection)
 
 On the instructor's machine, create a branch and deliberately replace the safe
 query with unsafe string interpolation.
@@ -212,6 +228,132 @@ starts automatically.
 > Locally you can confirm the demo premise first:
 > `python -m pytest tests/test_security.py` **fails** on this branch, and
 > `bandit -r app` reports a **B608** SQL-injection finding.
+
+---
+
+## More demo scenarios (optional)
+
+Beyond SQL injection, here are two more vulnerabilities you can demo the same
+way. Each **adds** a small feature file plus a regression test on a new branch;
+you then open a PR and watch the same review → fix → verify → summary flow. Both
+are verified to **fail** on the vulnerable code and **pass** once fixed.
+
+Fastest way to add them in the browser: **Add file → Create new file**, type the
+path, paste the code, and choose *"Create a new branch and start a pull
+request."* Add the test file to the same branch, then open the PR.
+
+### Scenario B — Hardcoded secret (CWE-798)
+
+*Bandit catches this too (**B105**) — reinforcing "deterministic tooling first,
+AI adds the explanation and the fix."*
+
+Add **`app/integrations.py`** (the vulnerable feature):
+
+```python
+"""Integration helpers for the GlobalTech risk-scoring API (demo)."""
+from __future__ import annotations
+
+# VULNERABLE (demo only): secret hardcoded in source.
+RISK_API_TOKEN = "glt_live_9f8a7b6c5d4e3f2a1b0c7d8e9f"
+
+
+def build_risk_api_headers() -> dict:
+    return {"Authorization": f"Bearer {RISK_API_TOKEN}"}
+```
+
+Add **`tests/test_integrations.py`** (regression test — fails on the vuln):
+
+```python
+from app import integrations
+from app.integrations import build_risk_api_headers
+
+
+def test_token_comes_from_environment(monkeypatch):
+    monkeypatch.setenv("GLOBALTECH_RISK_API_TOKEN", "test-token-abc")
+    headers = build_risk_api_headers()
+    assert headers["Authorization"] == "Bearer test-token-abc", (
+        "Secret appears to be hardcoded rather than read from the environment."
+    )
+```
+
+Expected AI fix — read the token from the environment:
+
+```python
+import os
+
+def build_risk_api_headers() -> dict:
+    token = os.environ["GLOBALTECH_RISK_API_TOKEN"]
+    return {"Authorization": f"Bearer {token}"}
+```
+
+*(No new GitHub secret needed — the test injects the value via `monkeypatch`.)*
+
+### Scenario C — Path traversal (CWE-22)
+
+*Bandit **misses** this (no taint analysis) — a great demonstration that **AI
+increases coverage beyond SAST**. Here only the AI reviewer and the regression
+test catch the flaw.*
+
+Add **`app/exports.py`** (the vulnerable feature):
+
+```python
+"""Account note read helper (demo)."""
+from __future__ import annotations
+
+from pathlib import Path
+
+EXPORT_DIR = Path("exports")
+
+
+def read_account_note(filename: str) -> str:
+    # VULNERABLE (demo only): filename is joined without validation, so an
+    # input like "../../etc/passwd" escapes EXPORT_DIR (path traversal).
+    return (EXPORT_DIR / filename).read_text(encoding="utf-8")
+```
+
+Add **`tests/test_exports.py`** (regression test — fails on the vuln):
+
+```python
+import pytest
+
+from app import exports
+from app.exports import read_account_note
+
+
+def test_read_account_note_blocks_path_traversal(tmp_path, monkeypatch):
+    export_dir = tmp_path / "exports"
+    export_dir.mkdir()
+    (export_dir / "note.txt").write_text("account note", encoding="utf-8")
+    (tmp_path / "secret.txt").write_text("TOP SECRET", encoding="utf-8")
+    monkeypatch.setattr(exports, "EXPORT_DIR", export_dir)
+
+    assert read_account_note("note.txt") == "account note"   # legit read works
+    with pytest.raises(ValueError):                           # traversal refused
+        read_account_note("../secret.txt")
+```
+
+Expected AI fix — confirm the resolved path stays inside `EXPORT_DIR`:
+
+```python
+def read_account_note(filename: str) -> str:
+    base = EXPORT_DIR.resolve()
+    target = (base / filename).resolve()
+    if target != base and base not in target.parents:
+        raise ValueError(f"Refusing to read outside the export directory: {filename!r}")
+    return target.read_text(encoding="utf-8")
+```
+
+### What each scenario shows at the baseline stage
+
+| Scenario | Baseline pytest | Baseline Bandit | AI Reviewer finds it? |
+|----------|:---------------:|:---------------:|:---------------------:|
+| A — SQL injection (CWE-89) | ❌ fails | ❌ B608 | ✅ |
+| B — Hardcoded secret (CWE-798) | ❌ fails | ❌ B105 | ✅ |
+| C — Path traversal (CWE-22) | ❌ fails | ✅ **clean (misses it)** | ✅ |
+
+Scenario C is the one to highlight for a security-leadership audience: **the SAST
+scan stays green, yet the AI reviewer still catches the flaw** — the clearest
+illustration of "AI augments existing controls."
 
 ---
 
@@ -371,8 +513,12 @@ lab is never locked to a single version.
 Before the first live run, make sure you have:
 
 - [ ] Pushed the secure baseline to `main`.
-- [ ] Added the `ANTHROPIC_API_KEY` repository **secret**.
+- [ ] Added the `ANTHROPIC_API_KEY` repository **secret** (use a
+      **workspace-scoped** key, or set `ANTHROPIC_WORKSPACE_ID` if your key is
+      identity-linked — see Setup step 3).
 - [ ] (Optional) Set the `ANTHROPIC_MODEL` repository **variable**.
+- [ ] Pushed with **git** (or created files via the web *editor*), so `.github/`
+      actually made it to the repo — the browser upload button skips it.
 - [ ] Confirmed Actions are enabled, and that workflows are allowed to write to
       pull requests (**Settings → Actions → General → Workflow permissions**).
       The per-job `permissions:` blocks handle scoping, but the repository must
