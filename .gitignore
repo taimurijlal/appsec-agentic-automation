@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# Generated AppSec artifacts (regenerated on every workflow run).
+# The directory itself is kept via artifacts/.gitkeep.
+artifacts/*
+!artifacts/.gitkeep
+
+# Local SQLite databases (the demo uses in-memory DBs, but just in case)
+*.db
+*.sqlite
+*.sqlite3
