@@ -36,7 +36,6 @@ def get_account(db: sqlite3.Connection, account_id: object) -> Account:
         The matching ``(id, name, email)`` tuple, or ``None`` if no account
         matches (including when the input is malformed).
     """
-    # SECURE (baseline on main):
     return db.execute(
         "SELECT id, name, email FROM accounts WHERE id = ?",
         (account_id,),
